@@ -26,6 +26,7 @@ class application_impl {
       }
       options_description     _app_options;
       options_description     _cfg_options;
+      variables_map           _options;
 
       bfs::path               _data_dir{"data-dir"};
       bfs::path               _config_dir{"config-dir"};
@@ -33,6 +34,8 @@ class application_impl {
       bfs::path               _config_file_name;
 
       uint64_t                _version = 0;
+      std::string             _version_str = appbase_version_string;
+      std::string             _full_version_str = appbase_version_string;
 
       std::atomic_bool        _is_quiting{false};
 
@@ -69,7 +72,19 @@ uint64_t application::version() const {
 }
 
 string application::version_string() const {
-   return appbase_version_string;
+   return my->_version_str;
+}
+
+void application::set_version_string( std::string v ) {
+   my->_version_str = std::move( v );
+}
+
+string application::full_version_string() const {
+   return my->_full_version_str;
+}
+
+void application::set_full_version_string( std::string v ) {
+   my->_full_version_str = std::move( v );
 }
 
 void application::set_default_data_dir(const bfs::path& data_dir) {
@@ -188,6 +203,7 @@ void application::set_program_options()
    app_cli_opts.add_options()
          ("help,h", "Print this help message and exit.")
          ("version,v", "Print version information.")
+         ("full-version", "Print full version information.")
          ("print-default-config", "Print default configuration template")
          ("data-dir,d", bpo::value<std::string>(), "Directory containing program runtime data")
          ("config-dir", bpo::value<std::string>(), "Directory containing configuration files such as config.ini")
@@ -202,8 +218,16 @@ void application::set_program_options()
 bool application::initialize_impl(int argc, char** argv, vector<abstract_plugin*> autostart_plugins) {
    set_program_options();
 
-   bpo::variables_map options;
-   bpo::store(bpo::parse_command_line(argc, argv, my->_app_options), options);
+   bpo::variables_map& options = my->_options;
+   try {
+      bpo::parsed_options parsed = bpo::command_line_parser(argc, argv).options(my->_app_options).run();
+      bpo::store(parsed, options);
+      vector<string> positionals = bpo::collect_unrecognized(parsed.options, bpo::include_positional);
+      if(!positionals.empty())
+         BOOST_THROW_EXCEPTION(std::runtime_error("Unknown option '" + positionals[0] + "' passed as command line argument"));
+   } catch( const boost::program_options::unknown_option& e ) {
+      BOOST_THROW_EXCEPTION(std::runtime_error("Unknown option '" + e.get_option_name() + "' passed as command line argument"));
+   }
 
    if( options.count( "help" ) ) {
       cout << my->_app_options << std::endl;
@@ -212,6 +236,11 @@ bool application::initialize_impl(int argc, char** argv, vector<abstract_plugin*
 
    if( options.count( "version" ) ) {
       cout << version_string() << std::endl;
+      return false;
+   }
+
+   if( options.count( "full-version" ) ) {
+      cout << full_version_string() << std::endl;
       return false;
    }
 
@@ -260,8 +289,14 @@ bool application::initialize_impl(int argc, char** argv, vector<abstract_plugin*
       write_default_config(my->_config_file_name);
    }
 
-   bpo::parsed_options opts_from_config = bpo::parse_config_file<char>(my->_config_file_name.make_preferred().string().c_str(), my->_cfg_options, false);
-   bpo::store(opts_from_config, options);
+   std::vector< bpo::basic_option<char> > opts_from_config;
+   try {
+      bpo::parsed_options parsed_opts_from_config = bpo::parse_config_file<char>(my->_config_file_name.make_preferred().string().c_str(), my->_cfg_options, false);
+      bpo::store(parsed_opts_from_config, options);
+      opts_from_config = parsed_opts_from_config.options;
+   } catch( const boost::program_options::unknown_option& e ) {
+      BOOST_THROW_EXCEPTION(std::runtime_error("Unknown option '" + e.get_option_name() + "' inside the config file " +  full_config_file_path().string()));
+   }
 
    std::vector<string> set_but_default_list;
 
@@ -276,7 +311,7 @@ bool application::initialize_impl(int argc, char** argv, vector<abstract_plugin*
          return false;
       }
 
-      for(const bpo::basic_option<char>& opt : opts_from_config.options) {
+      for(const bpo::basic_option<char>& opt : opts_from_config) {
          if(opt.string_key != od_ptr->long_name())
             continue;
 
@@ -352,6 +387,24 @@ void application::quit() {
 
 bool application::is_quiting() const {
    return my->_is_quiting;
+}
+
+void application::set_thread_priority_max() {
+#if __has_include(<pthread.h>)
+   pthread_t this_thread = pthread_self();
+   struct sched_param params{};
+   int policy = 0;
+   int ret = pthread_getschedparam(this_thread, &policy, &params);
+   if( ret != 0 ) {
+      std::cerr << "ERROR: Unable to get thread priority" << std::endl;
+   }
+
+   params.sched_priority = sched_get_priority_max(policy);
+   ret = pthread_setschedparam(this_thread, policy, &params);
+   if( ret != 0 ) {
+      std::cerr << "ERROR: Unable to set thread priority" << std::endl;
+   }
+#endif
 }
 
 void application::exec() {
@@ -450,6 +503,10 @@ bfs::path application::full_config_file_path() const {
 
 void application::set_sighup_callback(std::function<void()> callback) {
    sighup_callback = callback;
+}
+
+const bpo::variables_map& application::get_options() const{
+      return my->_options;
 }
 
 } /// namespace appbase
